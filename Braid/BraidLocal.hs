@@ -1,0 +1,299 @@
+-- Copyright (c) Peter Duncan White, 2003
+module BraidLocal
+    ( LT.Thread        -- The type of a lifted thread
+    , LT.getElapsed    -- Get elapsed time
+      -- Lifted state of a thread
+      -- MVar primitives
+    , MV.MVar          -- Abstract type of MVar
+    , newEmptyMVar     -- Create an MVar with no value in it
+    , newMVar          -- Create an MVar with a value in it
+    , putMVar          -- Put a new value in an MVar
+    , takeMVar         -- Take a value from an MVar
+    , modifyMVar       -- Using function of old value, put in new, return
+    , modifyMVar_      -- Put in a function of the old value
+    , withMVar         -- Create threader action on MVar value
+    , swapMVar         -- Swap contents of an MVar for a new value
+    , readMVar         -- Get the value out of an MVar, no modification
+      -- Simulation of channels for lifted threads
+    , newChan          -- Create a new channel
+    , writeChan	       -- :: Chan a -> a -> Braid ()
+    , readChan	       -- :: Chan a -> Braid a
+    , isEmptyChan      -- Determine if channel is empty
+    , getChanContents  -- :: Chan a -> Braid [a]
+    , writeList2Chan   -- :: Chan a -> [a] -> Braid ()
+      -- In support of fork
+    , myThreadId       -- Get the lifted thread Id
+    , yield            -- Yield the processor for a while
+      -- In support of debugging
+    , LT.putStrLn      -- Print out a line
+    , LT.putStr        -- Print out a string
+    , LT.showState     -- Show the internal lifted thread state
+      -- Internal implementation of thread delay
+    , threadDelay      -- Delay a lifted thread by specified tick count
+      -- In support of execption handling
+    , throw            -- Throw a local exception
+    , catch            -- Specify an exception handler
+    , throwTo          -- Throw a remote exception
+    , E.Exception (..) -- Exceptions that can be thrown
+      -- Lifts at the level of the local braid, visible to users.
+    , liftSt           -- Lift transformer on ls to local braid
+    , lifta            -- Lift transerver on ls
+    ) where
+
+-- Haskell imports
+import Prelude hiding ( catch, putStrLn, putStr )
+import Dynamic ( Typeable(..), fromDyn, toDyn )
+-- Resumption imports
+import qualified Ex as E
+-- Local imports
+import qualified LiftedState as LS
+import qualified LiftedThread as LT
+import qualified BraidMVar as MV
+import qualified ThreadId as TID
+import PreChan ( Chan (..), Stream (..), ChItem (..), writeEnd, readEnd )
+
+----------------------------------------------------------------------
+-- Lifted versions of the exception operations
+----------------------------------------------------------------------
+-- We should return here only if there is no catcher.
+-- The enclosing braid will take over
+-- here and transfer control to the catcher, if any.
+throw :: E.Exception -> LT.Thread ls ()
+throw e = LT.update (LS.throw e) >> LT.pause (return ())
+
+-- Catch an exception, by specifying a thread catcher
+catch :: LT.Thread ls () -> LT.Catcher ls -> LT.Thread ls ()
+catch prog hdlr = LT.liftSt (LS.addCatcher hdlr) >> prog
+
+-- Throw an exception to a remote thread
+throwTo :: TID.ThreadId -> E.Exception -> LT.Thread ls ()
+throwTo tid e = LT.liftSt (LS.throwTo tid e) >> LT.pause (return ())
+
+----------------------------------------------------------------------
+-- Lifted versions of the MVar operations. These operations affect
+-- only the lifted state within a thread. When the thread takes a
+-- pause, the braid can globalize the operation, according to the
+-- braid policy.
+----------------------------------------------------------------------
+
+-- Create a new MVar with no value
+-- Since the braid will return an MVar ID with an extension for
+-- uniqueness, we create the returned MVar out of the return
+-- MVar Id.
+newEmptyMVar :: String -> LT.Thread ls (MV.MVar a)
+newEmptyMVar name =
+  do { _ <- LT.pauseTranserver ( LS.newEmptyMVar name )
+     ; ls <- LT.fetch
+     ; case LS.making ls of
+          LS.NotMaking  -> error ( "BL.newEmptyMVar.1" )
+          LS.Making _ _ -> error ( "BL.newEmptyMVar.2" )
+          LS.Made mvid -> return ( MV.mkMVar mvid      )
+     }
+
+-- Create a new MVar with a value
+newMVar :: (Typeable a) => String -> a -> LT.Thread ls (MV.MVar a)
+newMVar name val =
+  do {
+--       LT.putStrLn ( ">>>BL.newMVar" )
+     ; _ <- LT.pauseTranserver (LS.newMVar name (toDyn val))
+--     ; LT.putStrLn ( "...BL.newMVar: " ++ show mvar )
+     ; ls <- LT.fetch
+     ; case LS.making ls of
+          LS.NotMaking  -> error  ( "BL.newMVar.1" )
+          LS.Making _ _ -> error  ( "BL.newMVar.2" )
+          LS.Made mvid  -> return ( MV.mkMVar mvid )
+     }
+
+-- Put a new value in an MVar (locally)
+putMVar :: (Typeable a) => MV.MVar a -> a -> LT.Thread ls ()
+putMVar mvar val =
+  do { -- LT.putStrLn ( ">>> BL.putMVar" )
+     ; LT.pauseSta (LS.putMVar (MV.mvarId mvar) (toDyn val)) (const ())
+     }
+
+-- Get the value from an MVar (locally)
+-- The loop on empty value is done locally, in this function.
+-- I think it needs multiple pauses because the lifted thread is competing
+-- with the update in the liftThread call in BraidInternal.hs??????
+takeMVar :: (Typeable a) => MV.MVar a -> LT.Thread ls a
+takeMVar mvar =
+  do { tid <- LT.getLiftedId
+       -- Because of the update to the local state, the braid will
+       -- take over here and process the MVar. This is like an invisible
+       -- function call in the code to liftedTakeMVar.
+     ; LT.update (LS.takeMVar (MV.mvarId mvar))
+     ; LT.pause (return ())
+       -- When the pause is returned, the takeMVar should be complete
+       -- so the other cases are an error. We must refetch the state
+       -- because it has changed on us in the interim.
+     ; ls <- LT.fetch
+     ; case LS.taking ls of
+         LS.NotTaking -> error ( "BL.takeMVar.1: " ++ show tid ++ show ls )
+         LS.Taking _  -> error ( "BL.takeMVar.2: " ++ show tid ++ show ls )
+         LS.Taken a   -> do { LT.update (LS.unTake)
+                            ; return (fromDyn a (error "BL.takeMVar"))
+                            }
+     }
+
+-- Stolen without shame from GHC (and modified)
+-- put back a new value, return something
+modifyMVar :: (Typeable a) =>
+    MV.MVar a                  ->  -- MVar to modify
+    (a -> LT.Thread ls (a, b)) ->
+    LT.Thread ls b
+modifyMVar m th = do { a <- takeMVar m
+                     ; (a',b) <- th a
+                     ; putMVar m a'
+                     ; return b
+                     }
+
+-- Stolen without shame from GHC (and modified)
+-- put back a new value, return ()
+modifyMVar_ :: (Typeable a) =>
+    MV.MVar a -> (a -> LT.Thread ls a) -> LT.Thread ls ()
+modifyMVar_ m io = do { a  <- takeMVar m
+                      ; a' <- io a
+                      ; putMVar m a'
+                      }
+
+-- Stolen without shame from GHC (and modified)
+-- put back the same value, return something
+withMVar :: (Typeable a) =>
+    MV.MVar a -> (a -> LT.Thread ls b) -> LT.Thread ls b
+withMVar m io = do { a <- takeMVar m
+                   ; b <- io a
+                   ; putMVar m a
+                   ; return b
+                   }
+
+-- Swap the contents of an MVar for a new value
+swapMVar :: (Typeable a) => MV.MVar a -> a -> LT.Thread ls a
+swapMVar mvar new = modifyMVar mvar (\old -> return (new,old))
+
+-- A shameless imitation of the GHC readMVar
+readMVar :: (Typeable a) => MV.MVar a -> LT.Thread ls a
+readMVar m = do { a <- takeMVar m
+                ; putMVar m a
+                ; return a
+                }
+
+----------------------------------------------------------------------
+-- Lifted versions of the channel operations, defined in terms of
+-- the MVar operations.
+----------------------------------------------------------------------
+-- newChan sets up the read and write end of a channel by
+-- initialising these two MVars with an empty MVar.
+newChan :: String -> LT.Thread ls (Chan a)
+newChan name =
+  do { hole      <- newEmptyMVar name
+     ; readHole  <- newMVar (readEnd name) (Stream hole)
+     ; writeHole <- newMVar (writeEnd name) (Stream hole)
+     ; return ( Chan { chanName  = name,
+                       chanRead  = readHole
+                     , chanWrite = writeHole
+                     }
+              )
+     }
+
+-- To put an element on a channel, a new hole at the write end is created.
+-- What was previously the empty @MVar@ at the back of the channel is then
+-- filled in with a new stream element holding the entered value and the
+-- new hole.
+writeChan :: (Typeable a, Show ls) => Chan a -> a -> LT.Thread ls ()
+writeChan ( Chan { chanName  = name, chanWrite = writeHole }) val =
+  do { new_hole <- newEmptyMVar (writeEnd name)
+     ; Stream old_hole <- takeMVar writeHole
+     ; putMVar writeHole (Stream new_hole)
+     ; putMVar old_hole (ChItem val (Stream new_hole))
+     }
+
+-- We need to delete the variable at the read end of the channel
+readChan :: (Show ls) => Chan a -> LT.Thread ls a
+readChan ( Chan { chanRead = readHole } ) =
+  do { -- lid <- LT.getLiftedId
+--     ; LT.putStrLn ( ">>> BL.readChan: " ++ show lid )
+     ; Stream read_end         <- takeMVar readHole
+--     ; LT.putStrLn ( "... BL.readChan.1: " )
+     ; ChItem val new_read_end <- takeMVar read_end
+     ; putMVar readHole new_read_end
+     ; return val
+     }
+
+-- Determine if channel is empty
+isEmptyChan :: (Typeable a, Show ls) => Chan a -> LT.Thread ls Bool
+isEmptyChan ( Chan { chanRead = readHole, chanWrite = writeHole } ) =
+  do { withMVar readHole $ \r -> do
+         w <- readMVar writeHole
+         let eq = r == w
+         eq `seq` return eq
+     }
+
+-- Operators for interfacing with functional streams.
+getChanContents :: (Show ls) => Chan a -> LT.Thread ls [a]
+getChanContents ch = do { x  <- readChan ch
+                        ; xs <- getChanContents ch
+                        ; return (x:xs)
+                        }
+
+-- Write a list of items to the channel
+writeList2Chan :: (Typeable a, Show ls) => Chan a -> [a] -> LT.Thread ls ()
+writeList2Chan ch ls = sequence_ (map (writeChan ch) ls)
+
+----------------------------------------------------------------------
+-- In support of fork
+----------------------------------------------------------------------
+
+-- Get the lifted thread Id
+myThreadId :: LT.Thread ls TID.ThreadId
+myThreadId = LT.observe LS.liftedId
+
+-- Yield the processor for a while
+-- At the lifted level this is just a null pause, so that the
+-- braid has the opportunity of scheduling another thread
+yield ::  LT.Thread ls ()
+yield = LT.nullPause
+
+----------------------------------------------------------------------
+-- In support of kernel IO activities
+----------------------------------------------------------------------
+-- Lift an IO action to a BdM action
+-- lift :: IO a -> LT.Thread ls a
+-- lift = LT.mkThread . R.lift
+
+----------------------------------------------------------------------
+-- Internal implementation of thread delay
+----------------------------------------------------------------------
+threadDelay :: Int -> LT.Thread ls ()
+threadDelay n = LT.pauseSt ( LS.threadDelay n )
+
+----------------------------------------------------------------------
+-- Lifts that are visible to the user
+----------------------------------------------------------------------
+
+-- Lift a transformer on ls
+liftSt :: (ls -> ls) -> LT.Thread ls ()
+liftSt f = LT.liftSt (LS.liftSt f)
+
+-- Lift a transerver on ls
+lifta :: (ls -> (ls, a)) -> LT.Thread ls a
+lifta f = LT.lifta (LS.lifta f)
+
+----------------------------------------------------------------------
+--  Inline some functions
+----------------------------------------------------------------------
+{-# INLINE newEmptyMVar     #-}
+{-# INLINE newMVar          #-}
+{-# INLINE putMVar          #-}
+{-# INLINE modifyMVar       #-}
+{-# INLINE modifyMVar_      #-}
+{-# INLINE withMVar         #-}
+{-# INLINE swapMVar         #-}
+{-# INLINE readMVar         #-}
+{-# INLINE myThreadId       #-}
+{-# INLINE yield            #-}
+{-# INLINE threadDelay      #-}
+{-# INLINE throw            #-}
+{-# INLINE throwTo          #-}
+{-# INLINE catch            #-}
+{-# INLINE liftSt           #-}
+{-# INLINE lifta            #-}

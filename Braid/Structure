@@ -1,0 +1,119 @@
+----------------------------------------------------------------------
+-- Braid Internal
+----------------------------------------------------------------------
+
+threadDelay
+  getElapsed >>=
+  pauseSt
+    $ BST.delayCurrent
+weave :: (Show ls) => Scheduler gs ls -> BraidSt gs ls -> Braid gs ls ()
+weave sched bst = store bst >> weave' sched 0
+
+weave' :: (Show ls) => Scheduler gs ls -> Int -> Braid gs ls ()
+weave' sched n =
+  do { elapsed <- getElapsed
+     ; oneWeave elapsed
+     ; when (n `mod` 32768 == 0) (putStrLn ( "Threads scheduled=" ++ show n ))
+     ; weave' sched (n + 1)
+     }
+
+oneWeave t = do { mrun <- stepRun t scheduleWeave prepareWeave updateWeave
+                ; return ()
+                }
+
+prepareWeave :: BraidSt gs ls -> TID.ThreadId -> IO (Run gs ls ())
+prepareWeave bst tid =
+  return Run { state = bst, cont = BST.getThreadProgram tid bst }
+
+scheduleWeave elapsed = BST.scheduleAndUpdate . BST.getExpired elapsed
+
+updateWeave elapsed tid _bst rn =
+  let ls          = BST.localState tid (state rn)
+      (bst1, ls1) = globalizes tid ls (state rn)
+      (bst2, ls2) = globalizeDelay elapsed tid ls1 bst1
+      bst3        = BST.updateProg tid (cont rn) bst2
+  in BST.updateLocalState tid ls2 bst3
+
+globalizeDelay elapsed tid ls bst =
+  case LS.delayCount ls of
+    Nothing    -> (bst, ls)
+    Just count ->
+      (BST.delay tid (elapsed + ( count `div` 10000)) bst, LS.nullDelay ls)
+
+globalizes tid ls bst =
+  let (bst', ls') = foldl (globalize tid) (bst,ls) (LS.mvarOps ls)
+  in (bst', LS.nullMVarOps ls')
+
+globalize tid (bst, ls) mvop =
+  case mvop of
+    LS.NewEmptyMVar { LS.mVarId = mvid } ->
+      (fst (BST.newMVar tid (LS.name mvid) Nothing bst), ls)
+    LS.NewMVar      { LS.mVarId = mvid, LS.mvVal = val } ->
+      (fst (BST.newMVar tid (LS.name mvid) (Just val) bst), ls)
+    LS.PutMVar      _ _ _ -> BST.putMVar tid mvop ls bst
+    LS.TakeMVar     _ _   -> BST.takeMVar tid mvop ls bst
+
+
+----------------------------------------------------------------------
+-- Braid State
+----------------------------------------------------------------------
+
+updateCurrent :: t -> Transformer t gs ls
+updateCurrent prog bst = updateProg (current bst) prog bst
+
+updateProg :: TID.ThreadId -> t -> Transformer t gs ls
+updateProg tid prog bst =
+  let tinfo = TI.updateThreadProgram prog (lookupThreadInfoHard tid bst)
+  in updateThreadInfo tid tinfo bst
+
+updateThreadInfo tid tinfo bst =
+  bst { threads = TS.update (threads bst) tid tinfo
+      , paused  = addPaused (TI.getThreadState tinfo) tid (paused bst)
+      }
+
+pause :: TI.ThreadState -> Transformer t gs ls
+pause thst bst = let bst' = updateRunningBraidState thst bst
+                 in addPausedCurrent thst bst'
+
+-- Add a thread to the paused list, only if the state is paused
+addPaused ::
+    TI.ThreadState  -> -- Current thread state
+    TID.ThreadId    -> -- Thread Id to make paused
+    TID.ThreadSet   -> -- Initial thread state
+    TID.ThreadSet      -- Final thread set
+addPaused thst tid tidset = if thst == TI.ThreadPaused
+                            then TID.addThread tidset tid
+                            else tidset
+
+delay :: TID.ThreadId -> Int -> Transformer t gs ls
+delay tid count bst =
+  let bst' = bst { delayQ = D.delay (D.mkDelayTid tid count) (delayQ bst)
+                 , paused = TID.delThread (paused bst) tid
+                 }
+  in updateTidState tid TI.ThreadDelayed bst'
+
+delayCurrent :: Int -> Transformer t gs ls
+delayCurrent count bst = delay (current bst) count bst
+
+getThreadProgram :: TID.ThreadId -> Observer t gs ls t
+getThreadProgram tid = TI.getThreadProgram . lookupThreadInfoHard tid
+
+getExpired :: Int -> Transformer t gs ls
+getExpired tick bst =
+  let ( dq, tids ) = D.getExpired tick (delayQ bst)
+  in updateTidsState tids TI.ThreadPaused ( bst { delayQ = dq } )
+
+scheduleAndUpdate :: Scheduler t gs ls
+scheduleAndUpdate bst =
+  if TID.nullTS (paused bst)
+  then ( bst, Nothing )
+  else ( bst { paused  = TID.tailTS (paused bst)
+             , current = TID.headTS (paused bst)
+             }
+       , (Just (TID.headTS (paused bst)))
+       )
+
+updateLocalState :: TID.ThreadId -> LS.LocalState ls -> Transformer t gs ls
+updateLocalState tid ls bst =
+  let tinfo = TI.updateLocalState ls (lookupThreadInfoHard tid bst)
+  in updateThreadInfo tid tinfo bst

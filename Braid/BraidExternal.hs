@@ -1,0 +1,147 @@
+-- Copyright (c) Peter Duncan White, 2003
+module BraidExternal
+    ( -- External braid using basic braid state (Braid)
+    , BI.Braid              -- Braid using basic braid state
+    , BI.ProgramType (..)   -- Is thread lifted or unlifted or wait?
+    , BI.BraidSt            -- State internal to Braid
+    , BI.Thread             -- A single thread monad
+    , BI.lift               -- Lift an IO action to the braid
+      -- Methods used to run the braid
+    , BI.weave              -- Weave threads into a braid
+      -- A scheduler is exported
+    , BI.scheduleAndUpdate  -- Choose the next thread to run
+      -- Definitions used to support MVars
+    , newEmptyMVar          -- Create new empty MVar
+    , newMVar               -- Create new MVar with specified value
+    , BI.deleteMVar         -- Delete an MVar
+    , BI.takeMVar           -- Take the value (if any) of an MVar
+    , BI.putMVar            -- Put a value into an MVar, when it is empty
+    , modifyMVar            -- Using function of old value, put in new, return
+    , modifyMVar_           -- Put in a function of the old value
+    , withMVar              -- Create threader action on MVar value
+    , swapMVar              -- Swap contents of an MVar for a new value
+    , readMVar              -- Get the value out of an MVar, no modification
+    , MV.MVar               -- Abstract type for MVars
+      -- Definitions in support of forking
+    , yield                 -- Yield the processor for a while
+    , BI.fork               -- Fork a new thread
+    , BI.threadDelay        -- Delay a thread by specified time interval
+    , BI.killThread         -- Kill the specified thread
+    , BI.myThreadId         -- Get your own thread Id
+    , BI.getElapsed         -- Get the elapsed time
+    , BI.nullPause          -- Create a pause in the thread
+      -- In support of thread ids
+    , TID.ThreadId          -- Abstract type for thread ids
+    , TID.mkLifted          -- Make a local thread Id
+    , TID.mkUnlifted        -- Make a global thread Id
+      -- In support of output to the screen
+    , BI.putStr             -- Put a string to the screen
+    , BI.putStrLn           -- Put a string plus line terminator to the screen
+    , BI.showState          -- Debugging only, show the internal state
+    , BI.threadCount        -- Debugging only, show count of threads scheduled
+    , BI.getLocal           -- Debugging only, show local braid id
+      -- In support of braid initialization
+    , BI.mkBraid            -- Make a braid and run to completion
+      -- Definitions in support of exception handling
+    , BI.throw              -- Throw synchronous exception (locally)
+    , throwTo               -- Throw asynchronous exception (non locally)
+    , catch                 -- Catch an exception
+    , BI.Exception (..)     -- Abstract data type for exceptions
+      -- In support of the layered braid
+    , BI.bundle             -- Lower braid as higher thread
+    , BI.forkLift           -- Lift a local thread into the braid (no tid)
+    ) where
+
+-- Haskell imports
+import Prelude hiding ( catch, putStr, putStrLn )
+import Dynamic (Typeable, toDyn)
+-- Local imports
+import qualified BraidInternal as BI
+import qualified BraidMVar as MV
+import qualified ThreadInfo as TI
+import qualified ThreadId as TID
+
+----------------------------------------------------------------------
+--
+--  The braid uses the braid 2 state, supporting dynamic threads
+--  (i.e. fork), and interthread communications using
+--  MVars. Note that channels are defined in terms of MVars, so
+--  that this braid supports channels as well.
+--
+--  In this module, the only constructor exported for a Braid is
+--  lift, which lifts a single thread manipulating its own state
+--  into the braid.  The lift/separate property ensures that these
+--  threads operation isolation.
+--
+--  Now to define the MVar primitives:
+----------------------------------------------------------------------
+
+-- Yield the processor, i.e. pause in the resumption monad
+yield :: BI.Braid gs ls ()
+yield = BI.pauseInState TI.Paused
+
+-- The resumption Threader version of the Haskell function newMVar
+-- A string is passed in for debugging, to give a name to the MVar
+newMVar ::(Typeable a, Show gs, Show ls) =>
+    String -> a -> BI.Braid gs ls (MV.MVar a)
+newMVar name val = BI.newMVar name (Just (toDyn val))
+
+-- Create a new empty MVar
+-- A string is passed in for debugging, to give a name to the MVar
+newEmptyMVar :: (Show gs, Show ls) =>
+    String -> BI.Braid gs ls (MV.MVar a)
+newEmptyMVar name = BI.newMVar name Nothing
+
+-- Stolen without shame from GHC (and modified)
+-- put back a new value, return something
+modifyMVar :: (Typeable a, Show ls, Show gs) => --
+    MV.MVar a                    -> -- MVar to modify
+    (a -> BI.Braid gs ls (a, b)) -> -- Function to modify MVar
+    BI.Braid gs ls b                -- Return extra value
+modifyMVar m io =
+  do { a <- BI.takeMVar m; (a',b) <- io a; BI.putMVar m a'; return b }
+
+-- Stolen without shame from GHC (and modified)
+-- put back a new value, return ()
+modifyMVar_ :: (Typeable a, Show ls, Show gs) => --
+    MV.MVar a -> (a -> BI.Braid gs ls a) -> BI.Braid gs ls ()
+modifyMVar_ m io = do { a  <- BI.takeMVar m; a' <- io a; BI.putMVar m a' }
+
+-- Stolen without shame from GHC (and modified)
+-- put back the same value, return something
+withMVar :: (Typeable a, Show ls, Show gs) => --
+    MV.MVar a -> (a -> BI.Braid gs ls b) -> BI.Braid gs ls b
+withMVar m io = do { a <- BI.takeMVar m; b <- io a; BI.putMVar m a; return b }
+
+-- Swap the contents of an MVar for a new value
+swapMVar :: (Typeable a, Show ls, Show gs) =>
+    MV.MVar a -> a -> BI.Braid gs ls a --
+swapMVar mvar new = modifyMVar mvar (\old -> return (new,old))
+
+-- A shameless imitation of the GHC readMVar
+readMVar :: (Typeable a, Show ls, Show gs) => MV.MVar a -> BI.Braid gs ls a
+readMVar m = do { a <- BI.takeMVar m; BI.putMVar m a; return a }
+
+----------------------------------------------------------------------
+-- Functions in support of exception handling
+----------------------------------------------------------------------
+
+-- Throw an asynchronous exception (non-local to the thread)
+-- The afficted thread is put in the paused state, meaning it loses
+-- track of the fact that it might have been waiting on an MVar.
+throwTo :: (Show gs, Show ls) =>
+    TID.ThreadId -> BI.Exception -> BI.Braid gs ls ()
+throwTo tid e =
+  do { curr <- BI.myThreadId
+       -- If the tid is the running thread, then do a synchronous exception
+     ; if tid == curr
+       then BI.throw e
+       else BI.throwTo tid e >> BI.nullPause
+     }
+
+-- Catch an exception
+catch :: (Show gs, Show ls) =>
+    BI.Braid gs ls () -> -- Possibly errant program
+    BI.Catcher gs ls  -> -- Catcher
+    BI.Braid gs ls ()
+catch prog catcher = BI.addCurrentCatcher catcher >> prog

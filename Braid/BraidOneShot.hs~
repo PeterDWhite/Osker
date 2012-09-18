@@ -1,0 +1,45 @@
+-- Copyright (C) Peter Duncan White, 2002, 2003
+-- Copyright (c) OHSU, 2002, 2003
+module BraidOneShot
+    ( OneShot           -- MVar written only once
+    , newOneShot        -- Create a new one shot
+    , shootOneShot      -- Do the single write
+    , shootManyOneShot  -- Do the single write to many one shots
+    , shoot             -- The value to shoot to a one shot
+    , waitToBeShot      -- Wait for a one shot to be shot
+    ) where
+
+-- Utility imports
+-- Braid imports
+import qualified OskerConcurrent as C
+import qualified BraidExternal as B
+
+type OneShot = C.MVar Int
+shoot :: Int
+shoot = 0
+
+-- Make a new one shot
+newOneShot :: (Show gs, Show ls) => String -> B.Braid gs ls OneShot
+newOneShot s = C.newEmptyMVar s
+
+-- Send the signal to the one shot
+shootOneShot :: (Show ls, Show gs) => OneShot -> Int -> B.Braid gs ls Int --
+shootOneShot oneshot j = do { C.putMVar oneshot j;
+                            ; j' <- C.takeMVar oneshot
+                            ; return j'
+                            }
+
+waitToBeShot :: (Show ls, Show gs) => OneShot -> B.Braid gs ls () --
+waitToBeShot o = do { j <- C.takeMVar o
+                    ; C.putMVar o (j + 1)
+                    }
+
+-- Shoot a bunch of one shots. This is done such that
+-- the threads stimulated will run in the order specified
+-- by the list of one shots.
+shootManyOneShot :: (Show ls, Show gs) =>
+    [OneShot] -> Int -> B.Braid gs ls () --
+shootManyOneShot [] _j = return ()
+shootManyOneShot (o:os) j = do { j' <- shootOneShot o j
+                               ; shootManyOneShot os j'
+                               }

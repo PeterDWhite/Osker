@@ -1,0 +1,40 @@
+-- Copyright (c) Peter Duncan White, 2003
+module Equivalence where
+
+----------------------------------------------------------------------
+--  Properties of relations
+----------------------------------------------------------------------
+
+-- Haskell imports
+import List
+-- Local imports
+import qualified Relation as R
+
+-- Generate the set of elements from the universe that are directly
+-- related to a given element of the universe
+closeElementOneStep :: (Ord x) => R.Relation x -> [x] -> x -> [x]
+closeElementOneStep r universe x = filter (\y -> r x y || r y x) universe
+
+-- Perform one step of closing a set, by adding members that are
+-- directly related to members of the set.
+closeSetOneStep :: (Ord x) => R.Relation x -> [x] -> [x] -> [x]
+closeSetOneStep r universe s =
+  if null s
+  then []
+  else let mins = minimumBy (\x y -> compare x y) s
+           rest = delete mins s
+           minClose = closeElementOneStep r universe mins
+       in minClose `union` (closeSetOneStep r universe rest)
+
+-- A function to return all members of some universe equivalent to
+-- a given element of the set. The name of this function is only
+-- justified when the underlying relation is an equivalence relation.
+equivalenceClass :: (Ord x) => R.Relation x -> [x] -> x -> [x]
+equivalenceClass r universe x = equivalenceClass' r universe [x]
+-- Helper function with an accumulator
+equivalenceClass' :: (Ord x) => R.Relation x -> [x] -> [x] -> [x]
+equivalenceClass' r universe accum =
+  let newMembers = closeSetOneStep r universe accum
+  in if null newMembers
+     then accum
+     else equivalenceClass' r universe (union accum newMembers)

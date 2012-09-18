@@ -1,0 +1,191 @@
+-- Copyright (c) Peter Duncan White, 2003
+-- Copyright (c) OHSU, 2003
+module LiftedThread
+    ( Thread              -- Type for a single thread in the braid
+    , mkLiftedState       -- Constructor for LiftedSt
+    , LiftedSt            -- LiftedState specialized to lifted thread programs
+    , Program             -- A storable thread program
+    , Transformer         -- Transformer on the lifted state
+    , liftSt              -- Lift a state transformer
+    , lifta               -- Lift a transform / observer to thread monad
+    , lift                -- Lift an IO action to a thread action
+    , T.proj              -- Project out of the thread
+    , T.mkThread          -- Constructor for a Thread
+    , pause               -- Pause raised to the lifted thread level
+    , fetch               -- Fetch raised to the lifted thread level
+    , T.store             -- Store a value in the state
+    , update              -- Update raised to the lifted thread level
+    , observe             -- Observe a feature of the internal state
+    , nullPause           -- Take a break
+    , pauseSta            -- State change, then pause, then observe the state
+    , pauseSt             -- State change, then pause
+    , pauseTranserver     -- Pause a transerver
+    , T.completeStateM    -- Run resumption, staying in underlying monad
+    , getElapsed          -- Get the elapsed time
+    , putStr              -- Put a string to the screen
+    , putStrLn            -- Put a line to the screen
+      -- Destructors
+    , LS.locale           -- Get the locale of a lifted state
+      -- RunM definitions
+    , runM                -- Run until a pause
+    , T.isDone            -- Determine when a thread is done
+      -- Layered braid
+    , raise               -- Raise from twisted braid to lifted thread
+    , lower               -- Lower from lifted thread to twisted braid
+      -- Debugging
+    , showState           -- Show the internal state
+    , LS.localeNull       -- Determine if the locale is null
+      -- Lifted state operations
+    , getLiftedName       -- Get the name of the thread
+    , getLiftedId         -- Get the id of the thread
+      -- In support of exceptions
+    , Catcher             -- Type of exception handler
+    , LS.takeFirstCatcher -- Get the first lifted catcher (if any)
+    ) where
+
+----------------------------------------------------------------------
+-- The lifted thread
+-- Operates only on its own lifted state
+----------------------------------------------------------------------
+
+-- Haskell imports
+import Prelude hiding ( putStr, putStrLn )
+-- Utility imports
+import Null
+-- Resumption imports
+import qualified Ex as E
+-- Braid imports
+import qualified LiftedState as LS
+import qualified Thread as T
+import qualified ThreadId as TID
+import qualified Locale as L
+
+-- A lifted thread in a braid
+type LiftedSt ls       = LS.LiftedState ls (Program ls)
+data Thread ls a       = Thread { internal :: T.Thread ( LiftedSt ls ) a }
+type Program ls        = Thread ls ()
+type Catcher ls        = E.Exception -> Program ls
+type Transformer ls    = LiftedSt ls -> LiftedSt ls
+
+-- Constructor
+mkLiftedState :: (Null ls) => String -> TID.ThreadId -> LiftedSt ls
+mkLiftedState s tid = LS.mkLiftedState s tid
+
+-- The lifted thread is a monad, adding the Thread constructor
+-- to the underlying Thread monad
+instance Monad (Thread ls) where
+    return = Thread . return
+    Thread p >>= k = Thread ( p >>= internal . k )
+
+----------------------------------------------------------------------
+-- Lifted state operations, lifted
+----------------------------------------------------------------------
+getLiftedName :: Thread ls String
+getLiftedName = Thread ( T.observe LS.liftedName )
+
+getLiftedId :: Thread ls TID.ThreadId
+getLiftedId = Thread ( T.observe LS.liftedId )
+
+----------------------------------------------------------------------
+--  In support of layered braid
+----------------------------------------------------------------------
+-- Raise MVars from a twisted braid into the encapsulating lifted thread
+raise :: L.Locale -> Thread ls ()
+raise = Thread . T.liftSt . LS.raise
+
+-- Raise MVars from the encapsulating lifted thread down to the twisted braid
+lower :: L.Locale -> Thread ls L.Locale
+lower = Thread . T.lifta . LS.lower
+
+----------------------------------------------------------------------
+--  Coercions
+----------------------------------------------------------------------
+
+-- State change, then pause
+pauseSt :: (Null a) => (LiftedSt ls -> LiftedSt ls) -> Thread ls a
+pauseSt = Thread . T.pauseSt
+
+nullPause :: (Null a) => Thread ls a
+nullPause = Thread ( T.nullPause )
+
+observe :: (LiftedSt ls -> a) -> Thread ls a
+observe = Thread . T.observe
+
+-- State change, then pause
+pauseSta ::
+    (LiftedSt ls -> LiftedSt ls) -> (LiftedSt ls -> a) -> Thread ls a
+pauseSta trans obs = Thread ( T.pauseSta trans obs )
+
+-- Pause a transerver
+pauseTranserver :: (LiftedSt ls -> (LiftedSt ls, a)) -> Thread ls a
+pauseTranserver = Thread . T.pauseTranserver
+
+-- Put a string to the screen
+putStr :: String -> Thread ls ()
+putStr = Thread . T.putStr
+
+-- Put a line to the screen
+putStrLn :: String -> Thread ls ()
+putStrLn = Thread . T.putStrLn
+
+-- Fetch raised to the lifted thread level
+fetch :: Thread ls (LiftedSt ls)
+fetch = Thread T.fetch
+
+-- Update raised to the lifted thread level
+update :: (LiftedSt ls -> LiftedSt ls) -> Thread ls ()
+update = Thread . T.update
+
+-- Pause raised to the local thread level
+pause :: Thread ls a -> Thread ls a
+pause (Thread t) = Thread (T.pause t)
+
+-- Lift a function on state
+liftSt :: (LiftedSt ls -> LiftedSt ls) -> Thread ls ()
+liftSt = Thread . T.liftSt
+
+-- Lift a state delta with a return value into the thread monad
+lifta :: ( LiftedSt ls -> ( LiftedSt ls, a ) ) -> Thread ls a
+lifta = Thread . T.lifta
+
+-- Lift an IO action into the thread monad
+lift :: IO a -> Thread ls a
+lift = Thread . T.lift
+
+-- Run a thread until a pause
+-- Also returns a flag when the thread is done
+runM :: LiftedSt ls -> Thread ls a -> IO (LiftedSt ls, Thread ls a, Bool)
+runM ls thread =
+  do { (ls', thread', done ) <- T.runM ls (internal thread)
+     ; return (ls', Thread thread', done )
+     }
+
+-- Get elapsed time raised to the thread level
+getElapsed :: Thread ls Int
+getElapsed = Thread T.getElapsed
+
+----------------------------------------------------------------------
+--  Debugging
+----------------------------------------------------------------------
+showState :: Thread ls ()
+showState = Thread ( T.fetch >>= \ls -> T.putStrLn ("LT.showState: " ++ show ls) )
+
+----------------------------------------------------------------------
+--  Inline some functions
+----------------------------------------------------------------------
+{-# INLINE getLiftedName    #-}
+{-# INLINE getLiftedId      #-}
+{-# INLINE raise            #-}
+{-# INLINE lower            #-}
+{-# INLINE fetch            #-}
+{-# INLINE update           #-}
+{-# INLINE getElapsed       #-}
+{-# INLINE pause            #-}
+{-# INLINE pauseSt          #-}
+{-# INLINE pauseSta         #-}
+{-# INLINE nullPause        #-}
+{-# INLINE observe          #-}
+{-# INLINE pauseTranserver  #-}
+{-# INLINE liftSt           #-}
+{-# INLINE lifta            #-}
+{-# INLINE lift             #-}

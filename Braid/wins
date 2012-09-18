@@ -1,0 +1,2 @@
+xterm -bg lemonchiffon -fg navyblue -geometry 90x50+20+20 &
+# xterm -bg lemonchiffon -fg navyblue -geometry 90x50-20+20 &

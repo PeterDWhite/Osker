@@ -1,0 +1,6 @@
+rm -f Test6; make Test6;
+# -h (or -hd) for the heap closure profile
+# -hr for the heap retainer profile
+# -hb for the biographical profile
+Test6 +RTS -xc -hr
+
