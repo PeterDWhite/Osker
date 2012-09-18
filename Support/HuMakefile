@@ -1,0 +1,1 @@
+SRC_DIRS=.:../P-Logic:../Domain:../Graph:../Kernel/Allocation:../Kernel/Actor:../Kernel/BoundedIO:../Kernel/DeviceDrivers:../Kernel/Executive:../Kernel/KernelCore:../Kernel/Message:../Kernel/Properties:../Kernel/Global:../Kernel/SystemHalf:../Kernel/FileSystem:../Posix:../Resumption:../Braid:../Utilities
