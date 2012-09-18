@@ -1,0 +1,13 @@
+# First argument:  Test number (required)
+# Second argument: Repeat count (optional)
+if [ -z "$1" ]; then
+    echo "No arguments supplied"
+    exit -1
+else
+    rm -f out$1;
+    rm -f Test$1;
+    make Test$1;
+    Test$1 ${2:-4} 2>&1
+#    Test$1 ${2:-4} +RTS -hd 2>&1
+fi
+exit

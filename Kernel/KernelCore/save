@@ -1,0 +1,477 @@
+-- Copyright (c) Peter Duncan White, 2001, 2002, 2003
+-- Copyright (c) OHSU, 2001, 2002, 2003
+module ProcessControl
+    ( updateProcess         -- Actor update to process as part of fork
+    , finishProcess         -- Finish process control work
+    , forkProcess           -- Actor part of a fork
+    , exitProcess           -- Actor part of an exit
+    , addProcessPCInternal  -- IO shell part of a fork
+    , addProcessGroup       -- Actor part of adding a process group
+    , addSession            -- Actor part of adding a session
+    ) where
+
+----------------------------------------------------------------------
+-- Requests for the kernel core portion of process control actions
+-- such as fork and exit.
+----------------------------------------------------------------------
+
+-- Haskell imports
+import qualified FiniteMap as FM
+import Monad
+import Maybe
+-- Utility imports
+import qualified IntGen as IG
+-- Posix imports
+import qualified ProcessName as PN
+import qualified ProcessId as PID
+import qualified Errno as ER
+import qualified FileName as FN
+-- Braid imports
+import qualified BraidExternal as B
+import qualified BraidUtilities as BU
+import qualified OskerConcurrent as C
+import qualified DomainBraid as DB
+import qualified PlatformBraid as PlB
+-- Debugging imports
+import qualified DomainOut as DO
+import qualified PlatformOut as PO
+-- Domain model imports
+import qualified DomainGraph as DOMG
+-- Osker imports
+import qualified SystemHalfBdM as SHB
+import qualified DeviceId as DID
+import qualified SystemHalfBounds as BD
+import qualified LocalPartitionedState as LPS
+import qualified KernelCoreActor as KCA
+import qualified KernelCoreActions as KCACT
+import qualified UnsafeAS as UAS
+import qualified GlobalPartitionedStateKey as GPSK
+import qualified GlobalPartitionedState as GPS
+import qualified ExecutiveParameters as EP
+import qualified OskerMessage as PM
+import qualified Process as P
+import qualified SystemHalf as SH
+import qualified SystemHalfCallTable as SHCT
+import qualified SystemHalfIOShell as IOS
+import qualified IOSOut as IOO
+import qualified SystemHalfMessage as SHM
+import qualified JobControlData as JCD
+import qualified DeviceMap as DM
+import qualified FileSystemPidBd as FSPB
+import qualified FileSystemPid as FSP
+import qualified UserHalfParameters as UHP
+
+----------------------------------------------------------------------
+-- Add a process: The process control portion, run at the Braid level
+----------------------------------------------------------------------
+
+addProcessPC ::
+    PM.OskerChannel ->             -- Channel to kernel core
+    PM.OskerChannel ->             -- Channel to the file system core
+    DM.DeviceMap    ->             -- Device channel information
+    FN.FileName     ->             -- Current working directory
+    PM.OskerRspPay  ->             -- The message from the actor
+    DB.DomainSt     ->             -- Input value of domain braid state
+    PlB.PlatformBraid ( DB.DomainSt          -- Output value domain braid st
+                      , Maybe PM.OskerRspPay -- Return msg for further work
+                      )
+addProcessPC kcChan fsCoreChan devmap cwd pay domSt =
+  let pcr = PM.getToProcessControlReq pay
+  in case pcr of
+       PM.AddProcessPCR { PM.apProcessTags  = processTags
+                        , PM.apProcessNode  = procNode
+                        , PM.forkingProcess = forking
+                        } ->
+         do { PO.platOut (">>> addProcessPC")
+            ; (domSt', procinfo) <-
+                 addProcessPCInternal
+                   processTags
+                   procNode
+                   kcChan
+                   fsCoreChan
+                   devmap
+                   cwd
+                   domSt
+            ; PO.platOut ("<<< addProcessPCInternal")
+              -- Generate a message to route back to an actor action
+            ; return ( domSt'
+                     , Just (PM.FromProcessControl
+                             ( PM.UpdateProcessPCR
+                               { PM.forkedProcess  = procinfo
+                               , PM.forkingProcess = forking
+                               }
+                             )))
+            }
+       _otherwise ->
+         error ("Bad message routed to AddProcess: " ++ show pay)
+
+-- Braid level work to actuall start the kernel threads for the process
+startProcessPC ::
+    PM.OskerPay        ->              -- The message from the actor
+    DB.DomainBraid (Maybe PM.OskerPay) -- Return msg for further work
+startProcessPC pay =
+  case PM.getToProcessControlReq pay of
+    PM.StartProcessPCR { PM.spForked  = forked
+                       , PM.spForking = forking
+                       } ->
+      do { DO.domOut (">>> startProcessPC")
+         ; P.startProcess forked
+         ; DO.domOut ("<<< startProcessPC")
+         ; return (Just ( PM.FromProcessControl
+                            PM.FinishProcessPCR
+                            { PM.fpForked  = P.prProcessTags forked
+                            , PM.fpForking = forking
+                            }
+                        ) )
+         }
+    _otherwise -> error "startProcessPC: not a start process message"
+
+-- Braid shell level processing for adding a process
+addProcessPCInternal ::
+    P.ProcessTags        ->   -- Various Ids about the process
+    DOMG.ProcessNodeData ->   -- Process / domain model info
+    PM.OskerChannel      ->   -- Channel to kernel core
+    PM.OskerChannel      ->   -- Channel to the file system core
+    DM.DeviceMap         ->   -- Device map
+    FN.FileName          ->   -- Current working directory
+    DB.DomainSt          ->   -- Input value of domain braid state
+    PlB.PlatformBraid ( DB.DomainSt              -- Output val dom braid state
+                      , P.Process PM.OskerRspMsg -- Information about process
+                      )
+addProcessPCInternal processTags procNode kcChan fsCoreChan devmap cwd domSt =
+  do { PO.platOut (">>> addProcessPCInternal")
+       -- Get the process name and process Id
+     ; let pname = P.prProcessName processTags
+           pid   = P.prProcessId processTags
+     -- Create the in channel to the system half
+     ; inChan <- PlB.lift ( C.newChan ((PN.outProcessName pname) ++ ".CHAN") )
+     -- Create the in channel to the file system "Pid" process
+     ; fsChan <- PlB.lift ( C.newChan ((PN.outProcessName pname) ++ ".fsPid") )
+     -- Set up the system half parameters
+     ; let systemHalfParameters =
+            EP.ExecutiveParameters
+              { EP.epProcessName    = pname
+              , EP.epProcessId      = pid
+              , EP.epLocalState     = SH.initSystemHalfPartitionedState
+                                        procNode processTags cwd
+              , EP.epCallTable      = SHCT.systemHalfCallTable
+              , EP.epScreen         = SH.systemHalfScreen
+              , EP.epReject         = EP.RejectFunction SH.systemHalfReject
+              , EP.epCallTableIndex = SHM.getCallTableIndex
+              , EP.epProcessNode    = procNode
+              }
+           mtimerdevinfo = FM.lookupFM devmap (fromEnum DID.TimerDeviceId)
+           timerdevinfo  = fromJust mtimerdevinfo
+           standarddevinfo =
+             fromJust (FM.lookupFM devmap (fromEnum DID.StandardInOut))
+           bounds = BD.SystemHalfBounds
+                    { BD.inputChan      = PM.OskerChannel inChan
+                    , BD.kernelCoreChan = kcChan
+                    , BD.timerChan      = PM.OskerChannel
+                                            (BU.tiChan timerdevinfo)
+                    , BD.standardChan   = PM.OskerChannel
+                                            (BU.tiChan standarddevinfo)
+                    , BD.fsChan         = PM.OskerChannel fsChan
+                    , BD.localName      = pname
+                    }
+           shbio = SHB.mkSystemHalfBdMC bounds
+           userHalfParameters = UHP.UserHalfParameters
+                                { UHP.program = DOMG.pndUserHalf procNode
+                                , UHP.slice   = 20000 -- **** Config later
+                                }
+     -- Create the IO shell
+     ; let (domSt', ioshell) =
+              B.forkLower
+                (PN.outProcessName pname ++ ".Sys/2")
+                inChan
+                ( SHB.toM
+                    bounds
+                    ( IOS.systemHalfIoShell
+                           shbio systemHalfParameters userHalfParameters
+                    )
+                )
+                domSt
+     ; PlB.lift ( C.yield )
+     -- Create the file system "Pid" thread
+     ; let fsBounds = FSPB.FileSystemPidBounds
+                      { FSPB.inputChan  = PM.OskerChannel fsChan
+                      , FSPB.fsCoreChan = fsCoreChan
+                      , FSPB.fsSys2Chan = PM.OskerChannel inChan
+                      , FSPB.localName  = pname
+                      }
+           fsBio    = FSPB.mkFileSystemPidBdC fsBounds
+           fsDD     = FSP.fsPid fsBio pname pid cwd
+     ; let (domSt'', fsThreadInfo) =
+             B.forkLower
+              (PN.outProcessName pname ++ ".fsPid")
+              fsChan
+              (PlB.proj (FSPB.toM fsBounds fsDD))
+              domSt'
+     -- Format the return message, which tells the actor
+     -- to update its tables with the information generated
+     -- here at the Braid level. To build the message, we will
+     -- clone the input message
+     ; return ( domSt''
+              , P.Process
+                { P.prIoShell        = ioshell
+                , P.prFileSysThread  = fsThreadInfo
+                , P.prProcessNode    = procNode
+                , P.prProcessTags    = processTags
+                }
+              )
+     }
+
+----------------------------------------------------------------------
+-- Update a process: The actor portion, after process control
+-- has already executed, adds the information generated at the Braid
+-- level into the fractured state. The fork prepares an 
+----------------------------------------------------------------------
+updateProcess :: KCA.KernelCoreSegment r
+updateProcess pay =
+  do { UAS.unsafeASIO (">>> updateProcess: " ++ show pay)
+     ; let pcr =PM.getFromProcessControlReq pay
+     ; let PM.UpdateProcessPCR { PM.forkedProcess  = process
+                               , PM.forkingProcess = forking
+                               } = pcr
+           processName    = P.prProcessName (P.prProcessTags process)
+           sys2Thread     = P.prIoShell process
+     -- Associate the user half tid with the process name in the
+     -- thread map.
+     ; KCACT.updateThreadMap (BU.tiTid sys2Thread) processName
+       -- Next, update the process map
+     ; KCACT.updateProcessMap processName process
+       -- Braid level work to start the process
+     ; KCA.defer ( PM.StartProcessPCR 
+                        { PM.spForked  = process
+                        , PM.spForking = forking
+                        }
+                 )
+                 startProcessPC
+     }
+
+-- Finish the processing of the fork
+finishProcess :: KCA.KernelCoreSegment r
+finishProcess pay =
+  let pcr = PM.getFromProcessControlReq pay
+  in case pcr of
+       PM.FinishProcessPCR { PM.fpForked  = forked
+                           , PM.fpForking = forking
+                           } ->
+         do { UAS.unsafeASIO (">>> finishProcess: " ++ show pay)
+            ; KCA.shRsp (PM.ForkResponse (Just (P.prProcessId forked)))
+                        (P.prProcessName forking)
+            }
+       _otherwise -> error ("finishProcess")
+
+----------------------------------------------------------------------
+--
+-- Fork a process
+--
+-- The process fork is triggered by the arrival of a ForkProcess
+-- kernel request. This message is processed by the forkProcess
+-- actor program. forkProcess generates an AddProcess
+-- message, which is routed to the IO shell. The AddProcess
+-- message is processed at the Braid level, by the function
+-- addProcessPC. addProcessPC calls addProcessPCInternal, which
+-- is also used during Osker initialization. The kernel core
+-- completes its processing with forkProcessFinish, which is
+-- triggered by the output message of addProcessPC.
+-- forkProcessFinish sends the response message back to
+-- the system half of the process that requested the fork.
+--
+----------------------------------------------------------------------
+forkProcess :: KCA.KernelCoreSegment r
+forkProcess pay =
+ do { UAS.unsafeASIO (">>> forkProcess: " ++ show pay)
+      -- Bust out the fields of the kernel core request:
+    ; let PM.ForkProcess { PM.fpTags = processTags
+                         , PM.fpNode = processNode
+                         } = PM.getKernelCoreReq pay
+    -- Access the kernel core thread Id
+    ; GPS.GfseKernelCoreChan kcChan <-
+        KCACT.getGlobalStateElement
+          (GPSK.GPSK (Right GPSK.GPSKKernelCoreChan))
+    -- Access the file system core channel
+    ; GPS.GfseFSCoreChan fsCoreChan <-
+        KCACT.getGlobalStateElement
+          (GPSK.GPSK (Right GPSK.GPSKFSCoreChan))
+    -- Access the file system root. For now, this is the initial current
+    -- working directory of every process
+    ; GPS.GfseFSRoot fsRoot <-
+        KCACT.getGlobalStateElement (GPSK.GPSK (Right GPSK.GPSKFSRoot))
+    -- Access the job control data
+    ; GPS.GfseJobControlData jcd <-
+        KCACT.getGlobalStateElement
+          (GPSK.GPSK (Right GPSK.GPSKJobControlData))
+    -- Access the PID generator
+    ; GPS.GfsePidGen pidGen <-
+        KCACT.getGlobalStateElement (GPSK.GPSK (Right GPSK.GPSKPidGen))
+    -- Access the Osker global var
+    ; GPS.GfseDeviceMap deviceMap <-
+        KCACT.getGlobalStateElement
+          (GPSK.GPSK (Right GPSK.GPSKDeviceMap))
+    -- Convert the tid into a process name
+    ; let -- The new process name is the base name (all but the last
+          -- last) of the process name, plus the newly generated PID
+          pname = P.prProcessName processTags
+          basename = PN.processGroupName pname
+          (pidGen', newPid) = IG.genNew pidGen
+          newProcessName = basename ++ [show newPid]
+    ; KCA.updateVanillaElt
+        (GPSK.GPSK (Right GPSK.GPSKPidGen))
+        (GPS.GfsePidGen pidGen')
+      -- Get the response context
+    ; let newProcessTags =
+            P.ProcessTags
+            { P.prProcessName = newProcessName
+            , P.prProcessId   = newPid
+              -- The process group id is unchanged
+            , P.prProcessGroupId = P.prProcessGroupId processTags
+              -- The new parent pid is the pid of the forking process
+            , P.prParentPid      = P.prProcessId processTags
+            }
+      -- Tell process control to create the new process
+    ; UAS.unsafeASIO "forkProcess: done updating"
+    ; KCA.defer
+        ( PM.AddProcessPCR { PM.apProcessTags  = newProcessTags
+                           , PM.apProcessNode  = processNode
+                           , PM.forkingProcess = processTags
+                           } )
+        ( addProcessPC kcChan fsCoreChan deviceMap fsRoot )
+    }
+
+----------------------------------------------------------------------
+-- Exit a process:
+--
+--   Remove it from the process / domain model
+--   Terminate the io shell, executive, and user half of the process.
+----------------------------------------------------------------------
+exitProcess :: KCA.KernelCoreSegment r
+exitProcess pay =
+  do { UAS.unsafeASIO ("exitProcess: " ++ show pay)
+       -- Access the job control data
+     ; GPS.GfseJobControlData jcd <-
+         KCACT.getGlobalStateElement
+           (GPSK.GPSK (Right GPSK.GPSKJobControlData))
+     ; let PM.ExitProcess pname = PM.getKernelCoreReq pay
+           mproc = FM.lookupFM (JCD.jcdProcessMap jcd) pname
+       in case mproc of
+            Nothing -> KCA.endActor []
+            Just proc ->
+              -- Bust apart the process data, in preparation to send
+              -- a delete process message to the process control at
+              -- the Braid level of the kernel shell.
+              let ioshellInfo = P.prIoShell proc
+                  processTags = P.prProcessTags proc
+              in do { -- Now remove the element from the process map
+                    ; UAS.unsafeASIO ("Exit: got proc")
+                    ; KCACT.reduceProcessMap pname
+                    -- Also remove it from the pid map
+                    ; KCACT.reducePidMap (P.prProcessId processTags)
+                    -- Also remove it from the thread map
+                    ; KCACT.reduceThreadMap (BU.tiTid ioshellInfo)
+                    -- Send the work up to the Braid level
+                    ; KCA.defer
+                        ( PM.DeleteProcessPCR
+                          { PM.dpProcessName = pname
+                          , PM.dpSystemHalfTid = BU.tiTid ioshellInfo
+                          }
+                        )
+                        ( delProcessPCInternal )
+                    }
+     }
+
+-- The Braid level action to complete the work of the exit() system
+-- call. This Braid level action kills the threads involved in the process
+delProcessPCInternal ::
+    PM.OskerPay             ->            -- The message from the actor
+    DB.DomainBraid (Maybe PM.OskerPay)    -- Return msg for further work
+delProcessPCInternal pay =
+  let pcr = PM.getToProcessControlReq pay
+  in case pcr of
+       PM.DeleteProcessPCR { PM.dpProcessName   = pname
+                           , PM.dpSystemHalfTid = ioshelltid
+                           } ->
+         do { IOO.iosOut pname "IO Shell delete process"
+            ; DB.lift ( C.killThread ioshelltid )
+            -- Update the trapHandler on the delete process
+            ; return Nothing
+            }
+       _otherwise ->
+         error "delProcessPCInternal: Not a delete process message"
+
+----------------------------------------------------------------------
+-- Add a process group:
+----------------------------------------------------------------------
+addProcessGroup :: KCA.KernelCoreSegment r
+addProcessGroup pay =
+  do { let PM.AddProcessGroup pid pgid tags = PM.getKernelCoreReq pay
+           pn = P.prProcessName tags
+     ; UAS.unsafeASIO ("pid: " ++ show pid)
+     -- Access the job control data
+     ; let pid' = if pid == PID.nullPID
+                  then P.prProcessId tags
+                  else pid
+     ; UAS.unsafeASIO ("pid': " ++ show pid')
+       -- Access the job control data
+     ; GPS.GfseJobControlData jcd <-
+         KCACT.getGlobalStateElement
+           (GPSK.GPSK (Right GPSK.GPSKJobControlData))
+       -- First check the condition that pgid is less than zero, this
+       -- calls for its own error code
+     ; if pgid < 0
+       then KCA.shRsp (PM.AddProcessGroupResponse ER.EINVAL) pn
+       else if pgid == PID.nullPID
+            then do { -- Update the job control data
+                    ; if JCD.searchPid jcd pid'
+                      then let mjcd' = JCD.newProcessGroupByPid jcd pid'
+                           in case mjcd' of
+                                Nothing ->
+                                  KCA.shRsp
+                                    (PM.AddProcessGroupResponse ER.EPERM) pn
+                                Just jcd' ->
+                                  do { KCACT.updateJobControlData jcd'
+                                       -- Respond to the calling system half
+                                     ; KCA.shRsp
+                                        (PM.AddProcessGroupResponse ER.NOERROR)
+                                        pn
+                                     }
+                      else -- Could not find pid
+                           KCA.shRsp (PM.AddProcessGroupResponse ER.ESRCH) pn
+                    }
+            else if JCD.searchProcessGroupId jcd pgid
+                 then let mjcd' = JCD.moveProcess jcd pid' pgid
+                      in case mjcd' of
+                           Nothing ->
+                             KCA.shRsp
+                               (PM.AddProcessGroupResponse ER.EPERM) pn
+                           Just jcd' ->
+                             do { KCACT.updateJobControlData jcd'
+                                  -- Respond to the calling system half
+                                ; KCA.shRsp
+                                   (PM.AddProcessGroupResponse ER.NOERROR) pn
+                                }
+                 else KCA.shRsp (PM.AddProcessGroupResponse ER.ESRCH) pn
+     }
+
+----------------------------------------------------------------------
+-- Add a session group:
+----------------------------------------------------------------------
+addSession :: KCA.KernelCoreSegment r
+addSession pay =
+  do { let PM.AddSession tags = PM.getKernelCoreReq pay
+           pn = P.prProcessName tags
+       -- Access the job control data
+     ; GPS.GfseJobControlData jcd <-
+         KCACT.getGlobalStateElement
+           (GPSK.GPSK (Right GPSK.GPSKJobControlData))
+     ; let mjcd' = JCD.newSession jcd (P.prProcessId tags)
+       in case mjcd' of
+            Nothing ->
+              KCA.shRsp (PM.AddSessionResponse ER.EPERM) pn
+            Just jcd' ->
+              do { KCACT.updateJobControlData jcd'
+                   -- Respond to the calling system half
+                 ; KCA.shRsp (PM.AddSessionResponse { PM.asrEr = ER.NOERROR } ) pn
+                 }
+     }

@@ -1,0 +1,4 @@
+echo "DemoVersions/CoreGets1.hs" with directory cache
+diff --brief CoreGets.hs DemoVersions/CoreGets1.hs
+echo "DemoVersions/CoreGets2.hs" without directory cache
+diff --brief CoreGets.hs DemoVersions/CoreGets2.hs

@@ -1,0 +1,1 @@
+SRC_DIRS=.:../../P-Logic:../../Domain:../../Graph:../../Posix:../../Resumption:../../Braid:../../Utilities:../Actor:../Allocation:../Message:../BoundedIO:../Global:../Executive:../SystemHalf:../DeviceDrivers:../FileSystem:

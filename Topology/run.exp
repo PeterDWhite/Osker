@@ -1,0 +1,33 @@
+#!/usr/bin/expect
+
+# Get the test case number from the command line arguments
+set t [lindex $argv 0]
+puts "\n--- run.exp: Executing test $t\n"
+# Get the repititions from the command line arguments
+if { [llength $argv] == 1 } {
+    set n 4
+    puts "Default repitition count: 4"
+} else {
+    set n [lindex $argv 1]
+}
+# Get the time/date for later print outs
+# spawn date
+# expect -regexp "P\[SD\]T" { set date $expect_out(buffer) }
+# Run the test case
+spawn -noecho r $t $n
+set timeout [expr $n + 12]
+
+expect {
+    timeout          { puts "\n--- run.exp: Test case $t failed (time out)"
+                     ; exit -1
+                     }
+    "fails"          { puts "\n--- run.exp: Test case $t failed"
+                     ; exit -1
+                     }
+    "Fail*"          { puts "\n--- run.exp: Test case $t failed\n"
+                     ; exit -1
+                     }
+    "Test $n passes" { puts "\n--- run.exp: Test case $t passed"
+                     ; exit 0
+                     }
+}

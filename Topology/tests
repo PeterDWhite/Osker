@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# Generate the list of tests, in increasing numerical order
+rm -f tt
+ls Test[0-9]*.hs | grep -v Support | sed -e "s/Test//" | sed -e "s/.hs//" | sort -g >tt
+
+# Execute the test cases, in increasing numerical order
+for x in `cat tt`
+do
+    echo ""
+    echo "--- tests: Executing test $x"
+    # Run the test case, and check its status
+    if run.exp $x 5
+    then
+        echo ""
+        echo "--- tests: Test case $x passes"
+    else
+        echo ""
+        echo "--- tests: *** Test case $x failed ***"
+        rm -f tt
+        exit -1
+    fi
+done
+
+# Report success, if you get here
+echo ""
+echo "--- tests: All tests passed!"
+echo ""
+rm -f tt

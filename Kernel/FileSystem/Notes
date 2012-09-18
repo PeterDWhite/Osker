@@ -1,0 +1,4 @@
+DemoVersions/CoreGets1.hs -- With directory cache
+DemoVersions/CoreGets2.hs -- Without directory cache
+Copy one of these over CoreGets.hs
+FileSystemCore.hs has edits for security breach attempts.
