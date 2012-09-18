@@ -1,0 +1,2 @@
+#!/bin/bash
+ghci -i../Graph -syslib text -syslib data $1
